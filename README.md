@@ -1,1 +1,1 @@
-# IA-Plain-Language-Assessment
+# IA Plain Language Assessment Project
