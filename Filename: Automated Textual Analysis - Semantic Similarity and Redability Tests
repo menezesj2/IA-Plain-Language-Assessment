@@ -1,0 +1,203 @@
+"""
+Filename: Automated Textual Analysis - Semantic Similarity and Redability Tests.py
+Author: Juliana Menezes
+Date: 2025-01-06
+Description: The script reads PDF documents and calculates readability and similarity metrics for the documents. In the context of this project, I am analysing Initial Project Descriptions (IPDs) and thier Plain Language Summaries (PLSs) created under the Canadian Impact Assessment Act, 2019. The code calculates similarity metrics for each pair of IPD and IDP PLSs.
+License: Creative Commons Attribution-NonCommercial-ShareAlike 4.0 (CC BY-NC-SA 4.0)
+         https://creativecommons.org/licenses/by-nc-sa/4.0/
+"""
+# Installing necessary modules
+!pip install pdfplumber textstat nltk sentence-transformers rouge-score
+
+# Use GPU if available
+import torch
+# Get device name and index if CUDA is available
+if torch.cuda.is_available():
+    device_index = torch.cuda.current_device()  # Get device index
+    device = f"cuda:{device_index}"  # Construct device string
+else:
+    device = "cpu"
+
+print(f"🔥 Running on {device.upper()}")
+
+# Calling modules
+import os
+import pdfplumber
+import re
+import nltk
+import textstat
+import json
+from sentence_transformers import SentenceTransformer, util
+from rouge_score import rouge_scorer
+
+# Ensure NLTK resources are available
+nltk.download("punkt")
+nltk.download('punkt_tab')
+
+# Load optimized BERT model on GPU
+model = SentenceTransformer("all-MiniLM-L6-v2").to(device)
+
+# Defining the path to the PDF folder
+pdf_folder = "input_path"
+
+# Checking Input Folder
+import os
+
+# Listing all files in the PDF folder
+pdf_files = [f for f in os.listdir(pdf_folder) if os.path.isfile(os.path.join(pdf_folder, f))]
+print(len(pdf_files))
+print(pdf_files)
+
+# Defining the path to the results output folder
+output_folder = "output_path"
+
+# Identifying project pairs
+pdf_files = set(os.listdir(pdf_folder))
+Projects = []
+
+for filename in pdf_files:
+    if "Initial Project Description Summary.pdf" in filename:
+        project_name = filename.replace("_Initial Project Description Summary.pdf", "")
+        description_file = project_name + "_Initial Project Description.pdf"
+
+        if description_file in pdf_files:
+            Projects.append({
+                "Project Name": project_name,
+                "Initial Project Description": description_file,
+                "Initial Project Description Summary": filename
+            })
+
+print(f"✅ Identified {len(Projects)} project pairs.")
+
+# Extract text from PDFs
+def extract_clean_text(pdf_path):
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            text = " ".join(page.extract_text() or "" for page in pdf.pages)
+
+        # Clean the text
+        text = re.sub(r"(?i)Page \d+|©.*?|Table of Contents", "", text)
+        text = re.sub(r"(?i)Figure \d+:.*|Table \d+:.*", "", text)
+        text = re.sub(r"(?i)References\s*.*$", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+    except Exception as e:
+        print(f"❌ Error extracting text from {pdf_path}: {e}")
+        return None
+
+# Compute Readability Scores
+def compute_readability(text):
+    if not text:
+        return {}
+
+    return {
+        "Flesch Reading Ease": textstat.flesch_reading_ease(text),
+        "Flesch-Kincaid Grade": textstat.flesch_kincaid_grade(text),
+        "SMOG Index": textstat.smog_index(text),
+        "Coleman-Liau Index": textstat.coleman_liau_index(text),
+        "Automated Readability Index": textstat.automated_readability_index(text),
+        "New Dale-Chall Score": textstat.dale_chall_readability_score(text),
+        "Difficult Words": textstat.difficult_words(text),
+        "Linsear Write Formula": textstat.linsear_write_formula(text),
+        "Gunning Fog Index": textstat.gunning_fog(text),
+        "Text Standard Level": textstat.text_standard(text, float_output=True),
+        "McAlpine EFLAW Score": textstat.mcalpine_eflaw(text),
+        "Reading Time (minutes)": round(textstat.reading_time(text, ms_per_char=14) / 60, 2),
+        "Lexicon Count": textstat.lexicon_count(text, removepunct=True),
+        "Syllable Count": textstat.syllable_count(text),
+        "Word Count": len(text.split())
+    }
+
+# Compute Semantic Similarity - Sentence Level Matching
+def semantic_similarity(text1, text2):
+    sentences1 = nltk.sent_tokenize(text1)
+    sentences2 = nltk.sent_tokenize(text2)
+
+    if not sentences1 or not sentences2:
+        return 0.0
+
+    batch_size = 8
+    max_similarities = []
+
+    for i in range(0, len(sentences1), batch_size):
+        batch1 = sentences1[i: i + batch_size]
+        embeddings1 = model.encode(batch1, convert_to_tensor=True)
+        embeddings2 = model.encode(sentences2, convert_to_tensor=True)
+
+        similarity_matrix = util.pytorch_cos_sim(embeddings1, embeddings2)
+        max_similarities.extend(similarity_matrix.max(dim=1).values.tolist())
+
+    return sum(max_similarities) / len(max_similarities)
+
+# Compute ROUGE Scores
+def compute_rouge(text1, text2):
+    scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+    scores = scorer.score(text1, text2)
+    return {metric: scores[metric].fmeasure for metric in scores}
+
+# Compute Jaccard Similarity
+def compute_jaccard_similarity(text1, text2):
+    words1 = set(nltk.word_tokenize(text1.lower()))
+    words2 = set(nltk.word_tokenize(text2.lower()))
+
+    if not words1 or not words2:
+        return 0.0  # Avoid division by zero
+
+    intersection = len(words1.intersection(words2))
+    union = len(words1.union(words2))
+
+    return intersection / union
+
+# Process each project and save results
+def process_project(row):
+    project_name = row["Project Name"]
+    desc_path = os.path.join(pdf_folder, row["Initial Project Description"])
+    summary_path = os.path.join(pdf_folder, row["Initial Project Description Summary"])
+
+    print(f"▶ Processing project: {project_name}")
+
+    if not os.path.exists(desc_path) or not os.path.exists(summary_path):
+        print(f"❌ Skipping {project_name}: Missing files.")
+        return
+
+    desc_text = extract_clean_text(desc_path)
+    summary_text = extract_clean_text(summary_path)
+
+    if not desc_text or not summary_text:
+        print(f"❌ Skipping {project_name}: Unreadable content.")
+        return
+
+    print(f"✅ Computing readability scores for {project_name}...")
+    desc_readability = compute_readability(desc_text)
+    summary_readability = compute_readability(summary_text)
+
+    print(f"✅ Computing semantic similarity for {project_name}...")
+    semantic_sim = semantic_similarity(summary_text, desc_text)
+
+    print(f"✅ Computing ROUGE scores for {project_name}...")
+    rouge_scores = compute_rouge(summary_text, desc_text)
+
+    print(f"✅ Computing Jaccard similarity for {project_name}...")
+    jaccard_sim = compute_jaccard_similarity(summary_text, desc_text)
+
+    # Save results in JSON
+    output_path = os.path.join(output_folder, f"{project_name}_Text_Analysis.json")
+    results = {
+        "Project": project_name,
+        "Semantic Similarity": round(semantic_sim, 4),
+        "ROUGE Scores": {k: round(v, 4) for k, v in rouge_scores.items()},
+        "Jaccard Similarity": round(jaccard_sim, 4),
+        "Readability (Initial Project Description)": desc_readability,
+        "Readability (Summary)": summary_readability
+    }
+
+    with open(output_path, "w", encoding="utf-8") as file:
+        json.dump(results, file, indent=4)
+
+    print(f"✅ Results saved to {output_path}")
+
+# Run sequentially
+for project in Projects:
+    process_project(project)
+
+print("✅ All projects processed!")
